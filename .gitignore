@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+agent_memory.db
+agent_memory.db-journal
+server.log
