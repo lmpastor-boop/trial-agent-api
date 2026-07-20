@@ -25,6 +25,7 @@ from typing import Annotated, TypedDict
 import requests
 from anthropic import Anthropic
 from langgraph.graph import END, StateGraph
+from langsmith.wrappers import wrap_anthropic
 
 from . import db
 
@@ -168,7 +169,11 @@ def retrieve_memory_node(state: AgentState) -> dict:
 # hand-labeled test set (see capstone writeup, Accuracy section)
 # ---------------------------------------------------------------------------
 def real_match_trial(patient_summary: str, trial: TrialCandidate) -> dict:
-    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # wrap_anthropic is a no-op unless LANGCHAIN_TRACING_V2=true is set --
+    # when tracing is on, it captures this call as a proper LLM span (exact
+    # prompt, response, token counts, latency) in LangSmith, instead of just
+    # the node's input/output state that LangGraph traces automatically.
+    client = wrap_anthropic(Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]))
     msg = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=300,
