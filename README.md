@@ -61,6 +61,17 @@ Match call) mocked out, so it runs without network access or API credits.
 It's not a substitute for hitting the real endpoints with a real key at
 least once, just a fast way to catch a broken wire before you do.
 
+## Evals
+
+`evals/` holds offline evaluation scripts -- not wired into the live API. Two
+pieces: a faithfulness check (does the Match rationale actually stick to the
+real trial text?) and an independent judge, meta-evaluated against the 8
+hand-labeled cases before being trusted to score larger batches of live
+trials. See `evals/README.md` for exact commands, and `EVAL_SKETCH.md` for
+the design rationale and real results from running it, including a
+production bug it caught and fixed (`max_tokens` truncation in
+`real_match_trial()`).
+
 **Python 3.13 note:** `requirements.txt` pins `anthropic<0.100` and
 `langgraph<0.4`. Both packages' newest release trains (as of mid-2026)
 use a very new TypedDict feature (`extra_items`, from PEP 728) that isn't

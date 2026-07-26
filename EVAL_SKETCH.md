@@ -1,8 +1,48 @@
 # Eval Sketch: Faithfulness + Meta-Evaluation for the Clinical Trial Matching Agent
 
-Status: design sketch, not implemented. Scoped to the two pieces of the Arize workshop
-that add real value on top of what's already built (LangSmith tracing, 8-case hand-labeled
-accuracy test), without duplicating tracing infrastructure you already have.
+Status: implemented and run for real. See `evals/` for the code and `Results (real
+run)` below for what it actually found — including one real production bug it caught
+and fixed. Scoped to the two pieces of the Arize workshop that add real value on top of
+what's already built (LangSmith tracing, 8-case hand-labeled accuracy test), without
+duplicating tracing infrastructure already in place.
+
+## Results (real run, 2026-07-26)
+
+**Meta-eval (`evals/meta_eval.py`) against the original 8 hand-labeled cases:**
+Ground-truth accuracy held at 7/8 (88%), consistent with the notebook's original result
+(though a different specific case missed this time — real run-to-run variance, not a
+fixed number). The independent judge agreed with the hand labels on 6/8 (75%), and the
+two disagreements were repeatable across two separate runs, not noise:
+
+- Case 1 (Maria / NCT05886049): the judge consistently found "Possibly eligible" as
+  defensible as the hand-labeled "Likely eligible" -- Maria's labs are described
+  qualitatively rather than with the exact values the trial's criteria ask for. Read as
+  a genuine ground-truth labeling ambiguity worth a second look, not a Match error.
+- Case 4 (David / NCT05101551): the judge and the faithfulness checker both
+  independently flagged the same issue -- the trial requires a specific Lansky/Karnofsky
+  score >=50, but David's summary only says "adequate," no number. The Match agent
+  accepted that vague phrasing as satisfying a numeric threshold. This looks like a real,
+  subtle reasoning gap, and arguably means the original hand label was slightly too
+  generous. A legitimate finding on its own, independent of anything else this eval work
+  produced.
+
+**Scale eval (`evals/scale_eval.py --n 30`) against 30 live ClinicalTrials.gov trials:**
+26 passed the age gate; the judge called all 26 "correct." Don't read that as 100%
+accuracy, though -- 23 of the 26 were the same easy majority-class call ("Likely not
+eligible" due to an obvious disease-type mismatch, e.g. CLL/ALL/CML/lymphoma vs. AML).
+The genuinely useful finding: the harder, more specific distinctions -- disease-status
+timing (newly diagnosed vs. in remission after induction), and negative-biomarker
+exclusion (FLT3-mutated required, patient is FLT3-ITD wildtype) -- held up correctly
+across many different real trials, which is a real generalization signal beyond the
+original 8 curated cases.
+
+**Bug found and fixed:** one of the 30 live trials (NCT06904066) exposed a live,
+production-affecting bug: `real_match_trial()`'s `max_tokens=300` was truncating some
+responses mid-JSON, silently falling back to a generic "needs more info" default rather
+than the model's real verdict. This is the exact bug already fixed in `evals/evaluators.py`
+during the meta-eval build, but it hadn't been applied to the actual `app/agent.py` Match
+function until the scale eval caught it in the wild. Fixed to `max_tokens=500`, verified
+with `test_smoke.py`, and pushed to production.
 
 No new platform account needed. This uses plain Anthropic calls in the same style as
 `real_match_trial()` — or, optionally, the open-source `arize-phoenix-evals` pip package
