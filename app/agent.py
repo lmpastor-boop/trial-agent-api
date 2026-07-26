@@ -176,7 +176,11 @@ def real_match_trial(patient_summary: str, trial: TrialCandidate) -> dict:
     client = wrap_anthropic(Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]))
     msg = client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=300,
+        # 500, not 300: found via evals/scale_eval.py against 30 live trials --
+        # at 300, some rationales were getting cut off mid-string, producing
+        # invalid JSON that silently fell back to a generic "needs more info"
+        # default instead of the model's real (often more decisive) verdict.
+        max_tokens=500,
         system=MATCH_SYSTEM_PROMPT,
         messages=[{
             "role": "user",
