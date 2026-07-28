@@ -52,6 +52,7 @@ def _call_json(prompt: str) -> dict:
         # producing invalid JSON that fell back to "unparsed" -- inflating the
         # apparent failure rate with token-budget noise rather than real signal.
         max_tokens=500,
+        temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = msg.content[0].text.strip()

@@ -181,6 +181,7 @@ def real_match_trial(patient_summary: str, trial: TrialCandidate) -> dict:
         # invalid JSON that silently fell back to a generic "needs more info"
         # default instead of the model's real (often more decisive) verdict.
         max_tokens=500,
+        temperature=0,
         system=MATCH_SYSTEM_PROMPT,
         messages=[{
             "role": "user",
