@@ -15,6 +15,12 @@ from unittest.mock import patch
 os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/trial_agent_api/smoke.db")
 os.environ.setdefault("ANTHROPIC_API_KEY", "smoke-test-placeholder")
 
+# SQLite will not create a missing parent directory -- it raises a bare
+# "unable to open database file" instead. On any fresh machine (Colab, CI,
+# a teammate's laptop) /tmp/trial_agent_api does not exist yet, so create it
+# before the engine is constructed.
+os.makedirs("/tmp/trial_agent_api", exist_ok=True)
+
 if os.path.exists("/tmp/trial_agent_api/smoke.db"):
     os.remove("/tmp/trial_agent_api/smoke.db")
 
