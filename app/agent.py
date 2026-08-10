@@ -86,29 +86,44 @@ def _extract_subtype_hints(patient_summary: str) -> set[str]:
     }
 
 
-def _is_disease_relevant(patient_summary: str, conditions: list[str]) -> bool:
-    """Recall-preserving by design: if the patient's subtype can't be
-    determined, or the trial has no condition tags to check, KEEP the trial
-    rather than risk a silent false negative. Only exclude when a trial's
-    conditions clearly name a sibling subtype the patient does not have."""
+# Bound on how many "ambiguous" trials (see classify_disease_relevance) are
+# sent to Match per session. Confidently-relevant trials are NEVER capped --
+# if a pull genuinely contains 50 real AML trials, all 50 are worth the
+# Match cost, that's the system doing its job. But measure_cost.py showed a
+# real "leukemia" pull sending 53/100 trials to Match at $0.33/session
+# ($661k/mo projected at 1M users) once app.agent's original deny-list-only
+# filter defaulted every ambiguous case to "keep" -- against a real pool of
+# 611 currently-recruiting AML trials (checked directly against
+# ClinicalTrials.gov), an unbounded ambiguous bucket doesn't scale. 10 is a
+# starting point, not a validated number -- revisit with real data on how
+# often the ambiguous bucket actually contains a true positive vs. noise.
+AMBIGUOUS_RELEVANCE_CAP = 10
+
+
+def classify_disease_relevance(patient_summary: str, conditions: list[str]) -> str:
+    """Three-way, not two-way, because the two failure modes need opposite
+    defaults. 'relevant': the patient's own subtype is named in this trial's
+    conditions -- always kept, uncapped, regardless of volume. 'irrelevant':
+    conditions clearly name an incompatible sibling subtype and not the
+    patient's own -- always dropped. 'ambiguous': neither signal is
+    present (unrecognized condition text, or no condition data at all) --
+    bounded by AMBIGUOUS_RELEVANCE_CAP in validate_hard_criteria_node,
+    rather than kept unconditionally the way the original version of this
+    function did."""
     hints = _extract_subtype_hints(patient_summary)
     if not hints or not conditions:
-        return True
+        return "ambiguous"
 
     conditions_text = " ".join(conditions).lower()
 
-    # If the trial's own conditions mention the patient's subtype, it's
-    # relevant regardless of anything else listed -- always keep it.
     if any(term in conditions_text for hint in hints for term in SUBTYPE_KEYWORDS[hint]):
-        return True
+        return "relevant"
 
-    # Otherwise, exclude only on a clear, named, incompatible sibling.
     for hint in hints:
         if any(bad in conditions_text for bad in INCOMPATIBLE_SUBTYPES.get(hint, [])):
-            return False
+            return "irrelevant"
 
-    # Unrecognized condition text -- ambiguous, so keep it.
-    return True
+    return "ambiguous"
 
 MATCH_VERDICTS = ["Likely eligible", "Possibly eligible (needs more info)", "Likely not eligible"]
 
@@ -216,17 +231,33 @@ def search_node(state: AgentState) -> dict:
 # "leukemia" query ranks AML-specific trials behind CLL/ALL/CML trials that
 # just happen to use the word "leukemia" more prominently), so it's checked
 # here too now, deterministically and for free, before anything reaches Match.
+#
+# "Relevant" trials are never capped; "ambiguous" ones are, at
+# AMBIGUOUS_RELEVANCE_CAP -- see that constant's comment for why an
+# unbounded ambiguous bucket doesn't scale against a real, large trial pool.
 # ---------------------------------------------------------------------------
 def validate_hard_criteria_node(state: AgentState) -> dict:
     validated, rejected = [], []
+    ambiguous_kept = 0
     for trial in state["candidates"]:
         age_ok = trial["min_age"] <= state["patient_age"] <= trial["max_age"]
         if not age_ok:
             rejected.append(f"{trial['nct_id']}: age out of range ({trial['min_age']}-{trial['max_age']})")
             continue
-        if not _is_disease_relevant(state["patient_summary"], trial.get("conditions", [])):
+
+        relevance = classify_disease_relevance(state["patient_summary"], trial.get("conditions", []))
+        if relevance == "irrelevant":
             rejected.append(f"{trial['nct_id']}: disease subtype mismatch ({trial.get('conditions', [])})")
             continue
+        if relevance == "ambiguous":
+            if ambiguous_kept >= AMBIGUOUS_RELEVANCE_CAP:
+                rejected.append(
+                    f"{trial['nct_id']}: ambiguous relevance, AMBIGUOUS_RELEVANCE_CAP "
+                    f"({AMBIGUOUS_RELEVANCE_CAP}) reached ({trial.get('conditions', [])})"
+                )
+                continue
+            ambiguous_kept += 1
+
         validated.append(trial)
     status = "ok" if validated else "no_eligible_trials"
     return {"validated_candidates": validated, "rejected_hard_criteria": rejected, "status": status}

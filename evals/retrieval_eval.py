@@ -14,19 +14,25 @@ For each ground-truth-positive (patient, trial) pair, this checks THREE
 things, in order, because each has a different fix:
 
   1. FINDABLE AT ALL -- does the trial appear anywhere in a large search
-     pull? If not, the search TERM/phrasing is the problem.
+     pull? If not, the search TERM/phrasing is the problem. (Tested and
+     ruled out for the two frozen fixtures here: their live ClinicalTrials.gov
+     records contain the exact query phrase in `conditions`, and there are
+     611 other currently-recruiting AML trials competing for rank -- this is
+     a volume problem, not a wording problem.)
 
   2. FINDABLE WITHIN THE OPERATIONAL CAP -- does it rank within
      app.agent.SEARCH_RESULT_CAP, the actual number search_node requests?
      Imported directly from app.agent, not hardcoded here, so this can't
-     silently drift out of sync the way the original 10-result cap did the
-     day this file was written and the day it was fixed to 100.
+     silently drift out of sync the way the original 10-result cap did.
 
-  3. SURVIVES THE RELEVANCE FILTER -- given the trial is findable within the
-     cap, does app.agent._is_disease_relevant keep it once
-     validate_hard_criteria_node runs? A trial can pass step 2 and still be
-     wrongly dropped by an overzealous filter -- this is what would catch
-     that regression.
+  3. SURVIVES IN PRACTICE -- given the trial is within the cap, does it
+     actually end up in validated_candidates once the REAL
+     validate_hard_criteria_node runs over the REAL first-SEARCH_RESULT_CAP
+     slate (not just this one trial in isolation)? This matters because
+     "ambiguous" trials now compete for a shared AMBIGUOUS_RELEVANCE_CAP --
+     a trial's own classification can be fine and it can still lose out to
+     other ambiguous trials ahead of it. This is the check that would catch
+     that trade-off actually costing a ground-truth case.
 
 Before concluding a trial was "missed," this script first confirms via a
 direct NCT-ID lookup that the trial is still RECRUITING. TEST_CASES was
@@ -39,14 +45,16 @@ Run from the trial_agent_api directory:
 
 Only tests the 2 clean "Likely eligible" ground-truth pairs by default, plus
 the 1 "Possibly eligible (needs more info)" pair as a labeled weaker signal
-(a trial that's a plausible-but-unconfirmed match should still surface for
-physician review, even if Match itself should hedge on it).
+-- note that pair is a good stress test for the ambiguous cap specifically,
+since its trial is a broad "hematologic malignancies" basket study unlikely
+to contain an exact subtype match in its conditions.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -57,7 +65,13 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-from app.agent import SEARCH_RESULT_CAP, _is_disease_relevant, real_search_clinicaltrials_gov  # noqa: E402
+from app.agent import (  # noqa: E402
+    AMBIGUOUS_RELEVANCE_CAP,
+    SEARCH_RESULT_CAP,
+    classify_disease_relevance,
+    real_search_clinicaltrials_gov,
+    validate_hard_criteria_node,
+)
 from evals.fixtures import TEST_CASES  # noqa: E402
 
 # Pull a bit past the real cap so a trial that's *just* outside it is still
@@ -83,6 +97,17 @@ def check_still_recruiting(nct_id: str) -> str:
     return status
 
 
+def _extract_patient_age(patient_text: str) -> int:
+    """fixtures.TEST_CASES patient strings all follow 'Name, NNx.' (e.g.
+    '45F', '16M'). Age isn't the thing being tested here -- validate_hard_
+    criteria_node needs *some* age to run, and every TEST_CASES patient's
+    real age is already known to pass their assigned trial's range by
+    construction (they're hand-labeled). Fall back to 45 (the sample patient
+    used elsewhere in this eval suite) if the pattern isn't found."""
+    m = re.search(r"(\d+)\s*[MF]\b", patient_text)
+    return int(m.group(1)) if m else 45
+
+
 def check_retrievability(nct_id: str, patient_summary: str, query: str) -> dict:
     pulled = real_search_clinicaltrials_gov(query, max_results=UNCAPPED_PULL)
     pulled_ids = [t["nct_id"] for t in pulled]
@@ -90,16 +115,31 @@ def check_retrievability(nct_id: str, patient_summary: str, query: str) -> dict:
     rank = pulled_ids.index(nct_id) + 1 if findable_at_all else None
     findable_within_cap = findable_at_all and rank <= SEARCH_RESULT_CAP
 
-    survives_filter = None
+    own_classification = None
+    survives_in_practice = None
     if findable_within_cap:
         trial = pulled[pulled_ids.index(nct_id)]
-        survives_filter = _is_disease_relevant(patient_summary, trial.get("conditions", []))
+        own_classification = classify_disease_relevance(patient_summary, trial.get("conditions", []))
+
+        # Run the REAL node over exactly what search_node would actually
+        # produce -- the first SEARCH_RESULT_CAP raw results -- not just this
+        # trial in isolation, so AMBIGUOUS_RELEVANCE_CAP competition among
+        # OTHER ambiguous trials in the same pull is captured too.
+        state = {
+            "search_query": query,
+            "patient_age": _extract_patient_age(patient_summary),
+            "patient_summary": patient_summary,
+            "candidates": pulled[:SEARCH_RESULT_CAP],
+        }
+        result = validate_hard_criteria_node(state)
+        survives_in_practice = nct_id in [t["nct_id"] for t in result["validated_candidates"]]
 
     return {
         "findable_at_all": findable_at_all,
         "rank": rank,
         "findable_within_cap": findable_within_cap,
-        "survives_filter": survives_filter,
+        "own_classification": own_classification,
+        "survives_in_practice": survives_in_practice,
         "n_pulled": len(pulled),
     }
 
@@ -119,11 +159,16 @@ def run_group(cases: list[dict], query: str, label: str) -> list[dict]:
         result = check_retrievability(nct_id, case["patient"], query)
         rows.append({"nct_id": nct_id, "skipped": False, "status": status, **result})
 
-        if result["findable_within_cap"] and result["survives_filter"]:
-            verdict = f"OK -- rank {result['rank']} of {result['n_pulled']}, within cap, passes relevance filter"
-        elif result["findable_within_cap"] and not result["survives_filter"]:
+        if result["findable_within_cap"] and result["survives_in_practice"]:
+            verdict = (f"OK -- rank {result['rank']} of {result['n_pulled']}, within cap, "
+                       f"classified {result['own_classification']!r}, survives in practice")
+        elif result["findable_within_cap"] and result["own_classification"] == "irrelevant":
             verdict = (f"FILTER FAILURE -- rank {result['rank']} of {result['n_pulled']}, within cap, but "
-                       f"_is_disease_relevant excluded it (filter regression -- check INCOMPATIBLE_SUBTYPES)")
+                       f"classified irrelevant (filter regression -- check INCOMPATIBLE_SUBTYPES)")
+        elif result["findable_within_cap"]:
+            verdict = (f"AMBIGUOUS-CAP FAILURE -- rank {result['rank']} of {result['n_pulled']}, within cap, "
+                       f"classified {result['own_classification']!r}, but lost out to "
+                       f"AMBIGUOUS_RELEVANCE_CAP ({AMBIGUOUS_RELEVANCE_CAP}) competition")
         elif result["findable_at_all"]:
             verdict = (f"CAP FAILURE -- rank {result['rank']} of {result['n_pulled']}, "
                        f"beyond SEARCH_RESULT_CAP ({SEARCH_RESULT_CAP})")
@@ -135,7 +180,8 @@ def run_group(cases: list[dict], query: str, label: str) -> list[dict]:
 
 
 def main(query: str) -> None:
-    print(f"Query term: {query!r}  |  SEARCH_RESULT_CAP: {SEARCH_RESULT_CAP}  |  pulled for this eval: {UNCAPPED_PULL}")
+    print(f"Query term: {query!r}  |  SEARCH_RESULT_CAP: {SEARCH_RESULT_CAP}  |  "
+          f"AMBIGUOUS_RELEVANCE_CAP: {AMBIGUOUS_RELEVANCE_CAP}  |  pulled for this eval: {UNCAPPED_PULL}")
 
     strong_rows = run_group(STRONG_POSITIVES, query, "STRONG ground truth (Likely eligible)")
     weak_rows = run_group(WEAK_POSITIVES, query, "WEAK ground truth (Possibly eligible -- should still surface)")
@@ -155,6 +201,7 @@ def main(query: str) -> None:
             "run_at": stamp,
             "query": query,
             "search_result_cap": SEARCH_RESULT_CAP,
+            "ambiguous_relevance_cap": AMBIGUOUS_RELEVANCE_CAP,
             "n_pulled": UNCAPPED_PULL,
             "strong_positive_results": strong_rows,
             "weak_positive_results": weak_rows,
@@ -165,28 +212,29 @@ def main(query: str) -> None:
     n = len(strong_scored)
     findable_at_all = sum(r["findable_at_all"] for r in strong_scored)
     findable_within_cap = sum(r["findable_within_cap"] for r in strong_scored)
-    fully_ok = sum(bool(r["findable_within_cap"] and r["survives_filter"]) for r in strong_scored)
+    fully_ok = sum(bool(r["findable_within_cap"] and r["survives_in_practice"]) for r in strong_scored)
 
     print()
     print("=" * 64)
     print(f"STRONG ground truth: {n} case(s) scored (others skipped, see above)")
-    print(f"  Findable at all:            {findable_at_all}/{n}")
-    print(f"  Findable within cap:        {findable_within_cap}/{n}")
-    print(f"  Within cap AND passes filter (end-to-end OK): {fully_ok}/{n}")
+    print(f"  Findable at all:                        {findable_at_all}/{n}")
+    print(f"  Findable within cap:                    {findable_within_cap}/{n}")
+    print(f"  Within cap AND survives in practice:    {fully_ok}/{n}")
 
     if n and findable_at_all < n:
         print("  >> Some ground-truth-eligible trials cannot be found by this query term at")
-        print("     all. That points at the search TERM/phrasing.")
+        print("     all. Before assuming it's phrasing, check directly whether ClinicalTrials.gov's")
+        print("     own record for that trial even contains the query text in its conditions --")
+        print("     it may just be outranked by a large pool of equally-relevant trials.")
     if n and findable_at_all > findable_within_cap:
         print(f"  >> Some trials are findable but rank beyond SEARCH_RESULT_CAP ({SEARCH_RESULT_CAP}).")
-        print("     That points at raising the cap further or paginating.")
     if n and findable_within_cap > fully_ok:
-        print("  >> Some trials rank within the cap but got excluded by the relevance filter.")
-        print("     That's a filter regression, not a search problem -- check INCOMPATIBLE_SUBTYPES")
-        print("     in app/agent.py for an overly broad deny term.")
+        print("  >> Some trials rank within the cap but didn't survive in practice. Check each")
+        print("     row's own_classification above: 'irrelevant' means a filter regression;")
+        print("     'ambiguous' means it lost a seat to AMBIGUOUS_RELEVANCE_CAP competition --")
+        print("     a real, disclosed trade-off for cost control, not a bug.")
     if n and fully_ok == n:
-        print("  All strong ground-truth trials made it all the way through: retrievable,")
-        print("  within the cap, and correctly kept by the relevance filter.")
+        print("  All strong ground-truth trials made it all the way through in practice.")
         print(f"  This does NOT mean the false-negative risk is zero -- it means these {n}")
         print("  specific known cases aren't currently being missed. The risk from trials")
         print("  outside this small ground-truth set remains unmeasured.")
