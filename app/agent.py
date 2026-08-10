@@ -169,6 +169,46 @@ class AgentState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
+# Query sharpening -- built from a real, evidenced finding (see
+# evals/test_query_specificity.py): ClinicalTrials.gov's relevance ranking
+# for query.cond rewards a query that echoes a trial's own eligibility-
+# criteria phrasing, not just its diagnosis name. A bare "acute myeloid
+# leukemia" query ranked a real, RECRUITING NPM1-mutated AML trial 193rd of
+# 300 (beyond SEARCH_RESULT_CAP=100, effectively invisible); "NPM1 mutation
+# acute myeloid leukemia" ranked the SAME trial 8th of 300. Production
+# (main.py's /match endpoint) was passing the caller's raw diagnosis_code
+# straight into query.cond with zero refinement -- this closes that gap for
+# patients whose summary names a detectable point-mutation biomarker.
+#
+# NOT a general fix, and deliberately scoped to what was actually tested:
+# the same experiment found gene-REARRANGEMENT biomarkers behave
+# differently -- "KMT2A rearranged leukemia" and "KMT2A rearrangement acute
+# myeloid leukemia" did NOT rank a real trial that explicitly targets KMT2A
+# rearrangements at all, within 300 results. So this only covers point-
+# mutation biomarkers using the ONE phrasing pattern shown to work
+# ("{MARKER} mutation {diagnosis}"), and only for NPM1 -- the only marker
+# actually tested this way. FLT3/IDH1/IDH2 are common AML point mutations
+# that plausibly behave the same way, but that's an untested assumption, not
+# a validated finding -- treat them as candidates for the same test (re-run
+# test_query_specificity.py with a trial known to target one of them),
+# not as proven. Falls back to the caller's raw diagnosis_code (today's
+# behavior) whenever no known marker is detected -- zero regression risk
+# for every patient this doesn't apply to.
+VALIDATED_MUTATION_QUERY_HINTS = ["npm1"]
+
+
+def build_search_query(diagnosis_code: str, patient_summary: str) -> str:
+    """Sharpens the search query for patients whose summary names a
+    validated point-mutation biomarker; otherwise returns diagnosis_code
+    unchanged. See the comment above for exactly what's validated vs. not."""
+    text = patient_summary.lower()
+    for marker in VALIDATED_MUTATION_QUERY_HINTS:
+        if marker in text:
+            return f"{marker.upper()} mutation {diagnosis_code}"
+    return diagnosis_code
+
+
+# ---------------------------------------------------------------------------
 # Search node -- real ClinicalTrials.gov v2 API call
 # ---------------------------------------------------------------------------
 def _parse_age(age_str: str | None) -> int | None:
@@ -403,7 +443,10 @@ def run_match(patient_diagnosis_code: str, patient_age: int, patient_summary: st
         "lessons": [],
         "rejected_hard_criteria": [],
         "status": "",
-        "search_query": patient_diagnosis_code,
+        # Sharpened when possible (see build_search_query's comment) instead
+        # of the raw diagnosis_code -- falls back to diagnosis_code unchanged
+        # for every patient without a validated marker in their summary.
+        "search_query": build_search_query(patient_diagnosis_code, patient_summary),
         "search_attempts": 0,
     }
     return app.invoke(initial_state)

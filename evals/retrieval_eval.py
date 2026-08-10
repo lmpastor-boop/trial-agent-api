@@ -68,6 +68,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 from app.agent import (  # noqa: E402
     AMBIGUOUS_RELEVANCE_CAP,
     SEARCH_RESULT_CAP,
+    build_search_query,
     classify_disease_relevance,
     real_search_clinicaltrials_gov,
     validate_hard_criteria_node,
@@ -108,7 +109,12 @@ def _extract_patient_age(patient_text: str) -> int:
     return int(m.group(1)) if m else 45
 
 
-def check_retrievability(nct_id: str, patient_summary: str, query: str) -> dict:
+def check_retrievability(nct_id: str, patient_summary: str, diagnosis_code: str) -> dict:
+    # Same sharpening run_match applies in production -- not the raw
+    # diagnosis_code directly -- so this eval can't silently drift from what
+    # a real session actually sends. See build_search_query's comment in
+    # app.agent for exactly which markers this does and doesn't cover.
+    query = build_search_query(diagnosis_code, patient_summary)
     pulled = real_search_clinicaltrials_gov(query, max_results=UNCAPPED_PULL)
     pulled_ids = [t["nct_id"] for t in pulled]
     findable_at_all = nct_id in pulled_ids
@@ -144,7 +150,7 @@ def check_retrievability(nct_id: str, patient_summary: str, query: str) -> dict:
     }
 
 
-def run_group(cases: list[dict], query: str, label: str) -> list[dict]:
+def run_group(cases: list[dict], diagnosis_code: str, label: str) -> list[dict]:
     print(f"\n--- {label} ({len(cases)} case{'s' if len(cases) != 1 else ''}) ---")
     rows = []
     for case in cases:
@@ -156,7 +162,10 @@ def run_group(cases: list[dict], query: str, label: str) -> list[dict]:
             rows.append({"nct_id": nct_id, "skipped": True, "status": status})
             continue
 
-        result = check_retrievability(nct_id, case["patient"], query)
+        actual_query = build_search_query(diagnosis_code, case["patient"])
+        if actual_query != diagnosis_code:
+            print(f"{nct_id}: sharpened query {actual_query!r} (from {diagnosis_code!r})")
+        result = check_retrievability(nct_id, case["patient"], diagnosis_code)
         rows.append({"nct_id": nct_id, "skipped": False, "status": status, **result})
 
         if result["findable_within_cap"] and result["survives_in_practice"]:
@@ -179,12 +188,13 @@ def run_group(cases: list[dict], query: str, label: str) -> list[dict]:
     return rows
 
 
-def main(query: str) -> None:
-    print(f"Query term: {query!r}  |  SEARCH_RESULT_CAP: {SEARCH_RESULT_CAP}  |  "
+def main(diagnosis_code: str) -> None:
+    print(f"Base diagnosis_code: {diagnosis_code!r} (per-case query may be sharpened -- see below)  |  "
+          f"SEARCH_RESULT_CAP: {SEARCH_RESULT_CAP}  |  "
           f"AMBIGUOUS_RELEVANCE_CAP: {AMBIGUOUS_RELEVANCE_CAP}  |  pulled for this eval: {UNCAPPED_PULL}")
 
-    strong_rows = run_group(STRONG_POSITIVES, query, "STRONG ground truth (Likely eligible)")
-    weak_rows = run_group(WEAK_POSITIVES, query, "WEAK ground truth (Possibly eligible -- should still surface)")
+    strong_rows = run_group(STRONG_POSITIVES, diagnosis_code, "STRONG ground truth (Likely eligible)")
+    weak_rows = run_group(WEAK_POSITIVES, diagnosis_code, "WEAK ground truth (Possibly eligible -- should still surface)")
 
     all_scored = [r for r in strong_rows + weak_rows if not r["skipped"]]
     if not all_scored:
@@ -199,7 +209,7 @@ def main(query: str) -> None:
     with open(out_path, "w") as f:
         json.dump({
             "run_at": stamp,
-            "query": query,
+            "diagnosis_code": diagnosis_code,
             "search_result_cap": SEARCH_RESULT_CAP,
             "ambiguous_relevance_cap": AMBIGUOUS_RELEVANCE_CAP,
             "n_pulled": UNCAPPED_PULL,
@@ -248,6 +258,7 @@ def main(query: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--query", type=str, default="leukemia",
-                         help="search term to test (default matches the rest of the eval suite)")
+                         help="base diagnosis_code to test (default matches the rest of the eval suite); "
+                              "per-case query may be sharpened further by build_search_query")
     args = parser.parse_args()
     main(args.query)

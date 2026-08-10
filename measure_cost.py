@@ -33,8 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anthropic import Anthropic  # noqa: E402
 
 from app.agent import (  # noqa: E402
+    AMBIGUOUS_RELEVANCE_CAP,
     MATCH_SYSTEM_PROMPT,
     SEARCH_RESULT_CAP,
+    classify_disease_relevance,
     search_node,
     validate_hard_criteria_node,
 )
@@ -101,6 +103,27 @@ def main(query: str, patient_summary: str, patient_age: int, limit: int | None) 
     validated, rejected = get_real_validated_candidates(query, patient_age, patient_summary)
     print(f"{len(validated)} trial(s) survived (age + disease-relevance); "
           f"{len(rejected)} rejected by the hard-criteria gate.\n")
+
+    # Breakdown: of the survivors, how many are confidently "relevant"
+    # (never capped, kept no matter how many there are) versus "ambiguous"
+    # (capped at AMBIGUOUS_RELEVANCE_CAP)? This answers whether a high
+    # session cost is the ambiguous-cap default being too loose, or just
+    # reflects a genuinely large population of confidently-matching trials
+    # -- those need different fixes, so don't guess which one it is.
+    relevant_n = sum(
+        1 for t in validated if classify_disease_relevance(patient_summary, t.get("conditions", [])) == "relevant"
+    )
+    ambiguous_n = len(validated) - relevant_n
+    print("Relevance breakdown of survivors:")
+    print(f"  relevant (uncapped, confident subtype match):  {relevant_n}")
+    print(f"  ambiguous (capped at {AMBIGUOUS_RELEVANCE_CAP}):                    {ambiguous_n}")
+    if relevant_n > ambiguous_n:
+        print(f"  >> Most of the cost below comes from confidently-relevant trials, not the")
+        print(f"     ambiguous cap. Lowering AMBIGUOUS_RELEVANCE_CAP further won't move this much --")
+        print(f"     this is a real population of matching trials, not filter leakage.\n")
+    else:
+        print(f"  >> The ambiguous bucket is the bigger share. AMBIGUOUS_RELEVANCE_CAP is the lever")
+        print(f"     that actually controls this cost.\n")
 
     if not validated:
         sys.exit("No trials survived the hard-criteria gate -- nothing to measure.")
