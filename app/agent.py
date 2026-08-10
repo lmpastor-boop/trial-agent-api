@@ -12,9 +12,10 @@ react to yet when /match is called. So `reflect`'s logic is exposed here as
 a plain function (submit_feedback) that the API's separate /feedback
 endpoint calls directly, not as a graph node reached by an edge.
 
-Everything else -- the age-only hard-criteria gate, the broaden-and-retry
-loop, the confidence-weighted memory read -- is unchanged from the
-validated notebook version.
+Everything else -- the broaden-and-retry loop, the confidence-weighted
+memory read -- is unchanged from the validated notebook version. The
+hard-criteria gate now checks disease-subtype relevance in addition to
+age (see the note above validate_hard_criteria_node for why).
 """
 from __future__ import annotations
 
@@ -31,11 +32,83 @@ from . import db
 
 MAX_SEARCH_ATTEMPTS = 2
 
+# How many raw results search_node pulls per attempt. 100, not 10: see the
+# comment in search_node for why. Named here, not inlined, so evals/
+# retrieval_eval.py can import the real value instead of hardcoding a copy
+# that silently goes stale the next time this changes -- exactly the bug
+# this constant's own introduction just avoided.
+SEARCH_RESULT_CAP = 100
+
 SUBTYPE_TO_PARENT_CATEGORY: dict[str, str] = {
     # Extend this as real narrow subtype codes are observed in production.
     # In a mature build this is a real ICD-10 hierarchy lookup, not a
     # hardcoded map -- see the capstone writeup for why.
 }
+
+# Same missing domain hierarchy as SUBTYPE_TO_PARENT_CATEGORY above, used in
+# the opposite direction: that table broadens a search that returned too
+# little, this one trims a search that returned too much. Both are stand-ins
+# for one real disease taxonomy that doesn't exist yet.
+#
+# Keys are subtype keywords findable in a patient_summary; values are the
+# substrings each keyword's presence should search for in a trial's
+# structured `conditions` list to detect a match.
+SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+    "aml": ["acute myeloid leukemia", "aml", "leukemia, myeloid, acute"],
+}
+
+# For each subtype keyword above, sibling subtypes that are clearly a
+# DIFFERENT disease -- exclude a trial only if its conditions name one of
+# these AND do not also mention the patient's own subtype. retrieval_eval.py
+# found real trials at rank 82-83/100 for a bare "leukemia" search because
+# CLL/ALL/CML trials that use the word "leukemia" prominently outrank
+# AML-specific trials in ClinicalTrials.gov's relevance ranking.
+INCOMPATIBLE_SUBTYPES: dict[str, list[str]] = {
+    "aml": [
+        "chronic lymphocytic leukemia", "cll",
+        "acute lymphoblastic leukemia", "all",
+        "chronic myeloid leukemia", "cml",
+        "hodgkin lymphoma", "non-hodgkin lymphoma", "lymphoma",
+        "multiple myeloma",
+    ],
+}
+
+
+def _extract_subtype_hints(patient_summary: str) -> set[str]:
+    """Which known subtype keywords (e.g. 'aml') does this patient's free-text
+    summary mention? Deterministic substring matching, not an LLM call --
+    keeps this gate free and fast, consistent with everything else standing
+    between raw search results and the paid Match step."""
+    text = patient_summary.lower()
+    return {
+        subtype for subtype, terms in SUBTYPE_KEYWORDS.items()
+        if any(term in text for term in terms)
+    }
+
+
+def _is_disease_relevant(patient_summary: str, conditions: list[str]) -> bool:
+    """Recall-preserving by design: if the patient's subtype can't be
+    determined, or the trial has no condition tags to check, KEEP the trial
+    rather than risk a silent false negative. Only exclude when a trial's
+    conditions clearly name a sibling subtype the patient does not have."""
+    hints = _extract_subtype_hints(patient_summary)
+    if not hints or not conditions:
+        return True
+
+    conditions_text = " ".join(conditions).lower()
+
+    # If the trial's own conditions mention the patient's subtype, it's
+    # relevant regardless of anything else listed -- always keep it.
+    if any(term in conditions_text for hint in hints for term in SUBTYPE_KEYWORDS[hint]):
+        return True
+
+    # Otherwise, exclude only on a clear, named, incompatible sibling.
+    for hint in hints:
+        if any(bad in conditions_text for bad in INCOMPATIBLE_SUBTYPES.get(hint, [])):
+            return False
+
+    # Unrecognized condition text -- ambiguous, so keep it.
+    return True
 
 MATCH_VERDICTS = ["Likely eligible", "Possibly eligible (needs more info)", "Likely not eligible"]
 
@@ -54,6 +127,7 @@ class TrialCandidate(TypedDict):
     min_age: int
     max_age: int
     location: str
+    conditions: list[str]
 
 
 class Ranking(TypedDict):
@@ -113,28 +187,47 @@ def real_search_clinicaltrials_gov(search_query: str, max_results: int = 10) -> 
             "min_age": _parse_age(elig.get("minimumAge")) or 0,
             "max_age": _parse_age(elig.get("maximumAge")) or 130,
             "location": "see contactsLocationsModule (fetch separately if needed)",
+            # Condition was already being requested in `fields` above but
+            # silently discarded here -- found while building the disease-
+            # relevance filter, which needs exactly this structured signal.
+            "conditions": proto.get("conditionsModule", {}).get("conditions", []),
         })
     return candidates
 
 
 def search_node(state: AgentState) -> dict:
-    candidates = real_search_clinicaltrials_gov(state["search_query"])
+    # SEARCH_RESULT_CAP (100), not the function's own default of 10:
+    # retrieval_eval.py found real, ground-truth-eligible trials ranking
+    # 82nd-83rd out of 100 for a bare "leukemia" query -- the old default of
+    # 10 would never have reached them. Search calls are free; only Match
+    # calls cost money. NOTE: this is a recall fix, not a free one -- more
+    # genuinely relevant trials surviving the filter below means more Match
+    # calls per session than before, not fewer. Re-measure with
+    # measure_cost.py after this change rather than assuming it's neutral.
+    candidates = real_search_clinicaltrials_gov(state["search_query"], max_results=SEARCH_RESULT_CAP)
     return {"candidates": candidates}
 
 
 # ---------------------------------------------------------------------------
-# Hard-criteria gate -- deterministic, age-only (see capstone writeup:
-# diagnosis relevance is handled upstream by the search API's own
-# query.cond matching, not a local exact-match check)
+# Hard-criteria gate -- deterministic, no model call. Checks age AND, as of
+# the retrieval eval, disease-subtype relevance. Diagnosis relevance used to
+# be described as "handled upstream by the search API's own query.cond
+# matching" -- retrieval_eval.py proved that alone isn't enough (a bare
+# "leukemia" query ranks AML-specific trials behind CLL/ALL/CML trials that
+# just happen to use the word "leukemia" more prominently), so it's checked
+# here too now, deterministically and for free, before anything reaches Match.
 # ---------------------------------------------------------------------------
 def validate_hard_criteria_node(state: AgentState) -> dict:
     validated, rejected = [], []
     for trial in state["candidates"]:
         age_ok = trial["min_age"] <= state["patient_age"] <= trial["max_age"]
-        if age_ok:
-            validated.append(trial)
-        else:
+        if not age_ok:
             rejected.append(f"{trial['nct_id']}: age out of range ({trial['min_age']}-{trial['max_age']})")
+            continue
+        if not _is_disease_relevant(state["patient_summary"], trial.get("conditions", [])):
+            rejected.append(f"{trial['nct_id']}: disease subtype mismatch ({trial.get('conditions', [])})")
+            continue
+        validated.append(trial)
     status = "ok" if validated else "no_eligible_trials"
     return {"validated_candidates": validated, "rejected_hard_criteria": rejected, "status": status}
 
