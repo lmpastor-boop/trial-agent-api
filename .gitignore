@@ -5,3 +5,5 @@ agent_memory.db
 agent_memory.db-journal
 server.log
 evals/runs/
+.venv/
+regression-gate-report.json

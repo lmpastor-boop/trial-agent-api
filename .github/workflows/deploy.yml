@@ -1,0 +1,41 @@
+name: quality-gated-deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: API and safety regression tests
+        run: python -m pytest
+      - name: Agent evaluation gate
+        run: python -m evals.regression_gate --report regression-gate-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deploy-regression-gate-report
+          path: regression-gate-report.json
+
+  deploy:
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    environment: portfolio-demo
+    steps:
+      - name: Trigger Render deployment after all gates pass
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "No deploy hook configured; quality gate passed and deployment was skipped."
+            exit 0
+          fi
+          curl --fail --silent --show-error --request POST "$RENDER_DEPLOY_HOOK_URL"

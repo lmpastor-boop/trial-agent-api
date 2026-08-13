@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/trial_agent_api/smoke.db")
 os.environ.setdefault("ANTHROPIC_API_KEY", "smoke-test-placeholder")
+os.environ.setdefault("AUTH_API_KEY", "smoke-test-api-key")
+AUTH_HEADERS = {"X-API-Key": "smoke-test-api-key", "X-Actor-ID": "dr-smoke"}
 
 # SQLite will not create a missing parent directory -- it raises a bare
 # "unable to open database file" instead. On any fresh machine (Colab, CI,
@@ -56,7 +58,7 @@ with TestClient(app) as client:  # context manager -- triggers lifespan startup/
     print("\n=== /match (mocked search + match) ===")
     with patch.object(agent, "real_search_clinicaltrials_gov", fake_search), \
          patch.object(agent, "real_match_trial", fake_match):
-        r = client.post("/match", json={
+        r = client.post("/match", headers=AUTH_HEADERS, json={
             "diagnosis_code": "leukemia",
             "age": 45,
             "patient_summary": "45F, confirmed diagnosis, ECOG 1, normal organ function.",
@@ -67,11 +69,22 @@ with TestClient(app) as client:  # context manager -- triggers lifespan startup/
     assert body["status"] == "ok"
     assert body["rankings"][0]["nct_id"] == "NCT05551234"
     assert body["rankings"][0]["verdict"] == "Likely eligible"
+    assert body["review_status"] == "pending"
     assert "physician review" in body["disclaimer"].lower()
+
+    print("\n=== human approval checkpoint ===")
+    review_id = body["review_id"]
+    r = client.post(
+        f"/reviews/{review_id}/decision", headers=AUTH_HEADERS,
+        json={"decision": "approved", "reason": "Synthetic review completed."},
+    )
+    print(r.status_code, r.json())
+    assert r.status_code == 200
+    assert r.json()["status"] == "approved"
 
     print("\n=== /match age-gate rejection (mocked search, no match needed) ===")
     with patch.object(agent, "real_search_clinicaltrials_gov", fake_search):
-        r = client.post("/match", json={
+        r = client.post("/match", headers=AUTH_HEADERS, json={
             "diagnosis_code": "leukemia",
             "age": 10,  # below the fake trial's min_age of 18
             "patient_summary": "10M, pediatric.",
@@ -84,7 +97,7 @@ with TestClient(app) as client:  # context manager -- triggers lifespan startup/
     assert "age out of range" in body["rejected_hard_criteria"][0]
 
     print("\n=== /feedback (real DB, no mocking needed) ===")
-    r = client.post("/feedback", json={
+    r = client.post("/feedback", headers=AUTH_HEADERS, json={
         "diagnosis_code": "leukemia",
         "nct_id": "NCT05551234",
         "decision": "reject",
@@ -96,13 +109,16 @@ with TestClient(app) as client:  # context manager -- triggers lifespan startup/
     assert r.json()["lessons"][0]["sample_size"] == 1
 
     print("\n=== /lessons (real DB read) ===")
-    r = client.get("/lessons")
+    r = client.get("/lessons", headers=AUTH_HEADERS)
     print(r.status_code, r.json())
     assert r.status_code == 200
     assert len(r.json()) == 1
 
     print("\n=== /match input validation (age out of allowed range) ===")
-    r = client.post("/match", json={"diagnosis_code": "leukemia", "age": 999, "patient_summary": "x"})
+    r = client.post(
+        "/match", headers=AUTH_HEADERS,
+        json={"diagnosis_code": "leukemia", "age": 999, "patient_summary": "x"},
+    )
     print(r.status_code)
     assert r.status_code == 422  # pydantic validation, never reaches the agent
 

@@ -14,25 +14,30 @@ actually require.
 - **Postgres-ready.** `app/db.py` uses SQLAlchemy instead of raw `sqlite3`,
   so the exact same code runs against a local SQLite file (no setup) or a
   real Postgres database (set `DATABASE_URL`), selected automatically.
-- **Two-call design.** The notebook's `run_once()` took physician feedback
-  as an input, because it was simulating an already-known decision for
-  demo purposes. A real API can't do that -- a physician reviews results
-  *after* getting them back. So this splits into `POST /match` (returns
-  ranked trials) and `POST /feedback` (submitted afterward, once a
-  physician has actually decided). See the docstring at the top of
-  `app/main.py` for the full reasoning.
+- **Explicit human commit point.** `POST /match` creates ranked trials in a
+  pending review. A named reviewer must call `/reviews/{id}/decision` before
+  the recommendation is approved or rejected. Separate `/feedback` data can
+  still improve confidence-weighted lessons after review.
 
 ## Endpoints
 
 | Method | Path        | Purpose                                            |
 |--------|-------------|-----------------------------------------------------|
-| GET    | `/health`   | Liveness check                                       |
-| POST   | `/match`    | Run search → validate → match, return ranked trials |
-| POST   | `/feedback` | Log a physician's accept/reject decision            |
-| GET    | `/lessons`  | Read current confidence-weighted memory             |
+| GET    | `/health`   | Public liveness check                                |
+| POST   | `/match`    | Create rankings and a pending human review           |
+| GET    | `/reviews/{id}` | Read the pending or decided review              |
+| POST   | `/reviews/{id}/decision` | Approve/reject once, with rationale     |
+| POST   | `/feedback` | Log trial-level physician feedback                   |
+| GET    | `/lessons`  | Read current confidence-weighted memory              |
+| GET    | `/audit-events` | Read PHI-minimized operational audit events      |
 
 Full request/response schemas are auto-documented at `/docs` once running
 (FastAPI's built-in Swagger UI).
+
+All routes except `/health` require `X-API-Key`; supply `X-Actor-ID` so
+review and audit records identify the synthetic/demo reviewer. A `/match`
+response is always pending until the one-time decision endpoint records a
+human approval or rejection. A second decision receives HTTP 409.
 
 ## Running locally
 
@@ -61,16 +66,56 @@ Match call) mocked out, so it runs without network access or API credits.
 It's not a substitute for hitting the real endpoints with a real key at
 least once, just a fast way to catch a broken wire before you do.
 
+For the repeatable offline regression suite used in continuous integration:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+python -m evals.regression_gate
+```
+
+The tests mock both external services, exercise the API contract, verify that
+the deterministic age gate prevents unnecessary model calls, and check that
+reviewer feedback persists and aggregates correctly.
+
+The regression gate fails closed if verdict accuracy, output parsing, or
+rationale faithfulness falls below its declared threshold. GitHub Actions runs
+that gate before the optional Render deployment hook, so a failed evaluation
+blocks deployment.
+
+## MCP tools
+
+Run the stdio MCP server with:
+
+```bash
+python -m app.mcp_server
+```
+
+It publishes two deliberately small, reusable tools:
+
+- `search_recruiting_trials` queries ClinicalTrials.gov using a condition.
+- `screen_trial_age` applies the deterministic age rule without an LLM.
+
+The MCP server does not accept free-text patient summaries and cannot approve
+a recommendation. Those operations remain behind the authenticated HTTP API,
+keeping the tool boundary safer and the human commit point explicit.
+
+## Portfolio roadmap
+
+The current API is the foundation of a larger forward-deployed engineering
+portfolio project. [`docs/PORTFOLIO_ROADMAP.md`](docs/PORTFOLIO_ROADMAP.md)
+defines the user, product boundary, success criteria, implementation
+milestones, and the evidence each milestone should produce.
+
 ## Evals
 
-`evals/` holds offline evaluation scripts -- not wired into the live API. Two
-pieces: a faithfulness check (does the Match rationale actually stick to the
-real trial text?) and an independent judge, meta-evaluated against the 8
-hand-labeled cases before being trusted to score larger batches of live
-trials. See `evals/README.md` for exact commands, and `EVAL_SKETCH.md` for
-the design rationale and real results from running it, including a
-production bug it caught and fixed (`max_tokens` truncation in
-`real_match_trial()`).
+`evals/` holds offline evaluators plus the CI regression gate. The evaluators
+check faithfulness and use an independent judge meta-evaluated against the
+eight hand-labeled cases. `baseline_results.json` records the validated
+capstone run; `regression_gate.py` turns its accuracy, parsing, and
+faithfulness metrics into deployment-blocking thresholds. See
+`evals/README.md` and `EVAL_SKETCH.md` for the design rationale and failure
+analysis, including the `max_tokens` truncation bug the evaluations exposed.
 
 **Python 3.13 note:** `requirements.txt` pins `anthropic<0.100` and
 `langgraph<0.4`. Both packages' newest release trains (as of mid-2026)
@@ -94,8 +139,8 @@ gives you (starts with `postgresql://`).
 - Render auto-detects the `Dockerfile`, or if you'd rather skip Docker,
   set Build Command to `pip install -r requirements.txt` and Start
   Command to `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
-- Add environment variables: `ANTHROPIC_API_KEY` and `DATABASE_URL` (the
-  Neon connection string from step 1).
+- Add `ANTHROPIC_API_KEY`, `AUTH_API_KEY`, `ALLOWED_ORIGINS`, and
+  `DATABASE_URL` (the Neon connection string from step 1).
 - Deploy. Render gives you a public URL like
   `https://your-app.onrender.com` -- `/health` should return `{"status":
   "ok"}`, and `/docs` gives you a UI to try `/match` without writing any
@@ -127,12 +172,12 @@ concretely, before any real patient data touches this:
   BAA explicitly does not extend to using their API through a third-party
   cloud reseller, so these are two genuinely different compliance stories,
   not interchangeable options.
-- **CORS is wide open** (`allow_origins=["*"]`) for demo convenience --
-  restrict this to your actual frontend's origin before it's public with
-  real data flowing through it.
-- **No auth on any endpoint.** Anyone with the URL can call `/match` or
-  read `/lessons`. A real deployment needs at least an API key check, more
-  realistically OAuth tied to a clinician's identity.
+- **Portfolio authentication is not clinical authentication.** The demo uses
+  a constant-time API-key check and actor IDs, but a real deployment needs
+  OAuth/OIDC, role-based authorization, key rotation, and managed secrets.
+- **Audit events intentionally exclude patient-summary text.** Production
+  retention, access, export, and tamper-evidence policies still require formal
+  design and review.
 - **Free-tier hosting has cold starts and no uptime guarantee** -- fine
   for a portfolio piece, not fine for something a physician is relying on
   mid-workflow.
