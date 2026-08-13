@@ -14,6 +14,9 @@ The two retrieval patterns are unchanged from the notebook:
 from __future__ import annotations
 
 import os
+import json
+import uuid
+from datetime import datetime, timezone
 from typing import TypedDict
 
 from sqlalchemy import create_engine, text
@@ -42,7 +45,7 @@ class Lesson(TypedDict):
 
 
 def init_db() -> None:
-    """Create the feedback table if it doesn't exist. Call once at startup."""
+    """Create application, human-review, and audit tables at startup."""
     is_sqlite = _engine.dialect.name == "sqlite"
     id_col = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "SERIAL PRIMARY KEY"
     created_default = "CURRENT_TIMESTAMP" if is_sqlite else "NOW()"
@@ -57,6 +60,138 @@ def init_db() -> None:
                 created_at TIMESTAMP DEFAULT {created_default}
             )
         """))
+        con.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS match_reviews (
+                id TEXT PRIMARY KEY,
+                patient_diagnosis_code TEXT NOT NULL,
+                rankings_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                decided_by TEXT,
+                decision_reason TEXT,
+                created_at TIMESTAMP DEFAULT {created_default},
+                decided_at TIMESTAMP
+            )
+        """))
+        con.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id {id_col},
+                request_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT,
+                outcome TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT {created_default}
+            )
+        """))
+
+
+def create_match_review(
+    diagnosis_code: str, rankings: list[dict], created_by: str
+) -> str:
+    """Persist a reviewable recommendation without storing patient free text."""
+    review_id = str(uuid.uuid4())
+    with _engine.begin() as con:
+        con.execute(
+            text(
+                "INSERT INTO match_reviews "
+                "(id, patient_diagnosis_code, rankings_json, status, created_by) "
+                "VALUES (:id, :diagnosis_code, :rankings_json, 'pending', :created_by)"
+            ),
+            {
+                "id": review_id,
+                "diagnosis_code": diagnosis_code,
+                "rankings_json": json.dumps(rankings),
+                "created_by": created_by,
+            },
+        )
+    return review_id
+
+
+def get_match_review(review_id: str) -> dict | None:
+    with _engine.connect() as con:
+        row = con.execute(
+            text(
+                "SELECT id, patient_diagnosis_code, rankings_json, status, "
+                "created_by, decided_by, decision_reason, created_at, decided_at "
+                "FROM match_reviews WHERE id = :id"
+            ),
+            {"id": review_id},
+        ).mappings().first()
+    if row is None:
+        return None
+    result = dict(row)
+    result["rankings"] = json.loads(result.pop("rankings_json"))
+    return result
+
+
+def decide_match_review(
+    review_id: str, decision: str, reason: str, decided_by: str
+) -> dict | None:
+    """Atomically decide a pending review; a decided review cannot be overwritten."""
+    decided_at = datetime.now(timezone.utc)
+    with _engine.begin() as con:
+        result = con.execute(
+            text(
+                "UPDATE match_reviews SET status = :decision, decided_by = :decided_by, "
+                "decision_reason = :reason, decided_at = :decided_at "
+                "WHERE id = :id AND status = 'pending'"
+            ),
+            {
+                "id": review_id,
+                "decision": decision,
+                "decided_by": decided_by,
+                "reason": reason,
+                "decided_at": decided_at,
+            },
+        )
+        if result.rowcount == 0:
+            return None
+    return get_match_review(review_id)
+
+
+def log_audit_event(
+    *, request_id: str, actor_id: str, action: str, resource_type: str,
+    resource_id: str | None, outcome: str, details: dict | None = None,
+) -> None:
+    """Write a minimal audit event. Callers must never pass PHI in details."""
+    with _engine.begin() as con:
+        con.execute(
+            text(
+                "INSERT INTO audit_events "
+                "(request_id, actor_id, action, resource_type, resource_id, outcome, details_json) "
+                "VALUES (:request_id, :actor_id, :action, :resource_type, :resource_id, :outcome, :details_json)"
+            ),
+            {
+                "request_id": request_id,
+                "actor_id": actor_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "outcome": outcome,
+                "details_json": json.dumps(details or {}, sort_keys=True),
+            },
+        )
+
+
+def get_audit_events(limit: int = 100) -> list[dict]:
+    with _engine.connect() as con:
+        rows = con.execute(
+            text(
+                "SELECT request_id, actor_id, action, resource_type, resource_id, "
+                "outcome, details_json, created_at FROM audit_events "
+                "ORDER BY created_at DESC, id DESC LIMIT :limit"
+            ),
+            {"limit": limit},
+        ).mappings().all()
+    events = []
+    for row in rows:
+        event = dict(row)
+        event["details"] = json.loads(event.pop("details_json"))
+        events.append(event)
+    return events
 
 
 def log_feedback(diagnosis_code: str, nct_id: str, decision: str, reason_pattern: str) -> None:

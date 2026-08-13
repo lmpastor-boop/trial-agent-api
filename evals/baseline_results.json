@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "description": "Recorded capstone validation run against the eight frozen hand-labeled cases.",
+  "cases": [
+    {"case_id": 0, "expected": "Likely eligible", "predicted": "Likely eligible", "parsed": true, "faithful": true},
+    {"case_id": 1, "expected": "Likely not eligible", "predicted": "Likely not eligible", "parsed": true, "faithful": true},
+    {"case_id": 2, "expected": "Likely not eligible", "predicted": "Likely not eligible", "parsed": true, "faithful": true},
+    {"case_id": 3, "expected": "Likely eligible", "predicted": "Likely eligible", "parsed": true, "faithful": true},
+    {"case_id": 4, "expected": "Likely not eligible", "predicted": "Likely not eligible", "parsed": true, "faithful": true},
+    {"case_id": 5, "expected": "Likely not eligible", "predicted": "Likely not eligible", "parsed": true, "faithful": true},
+    {"case_id": 6, "expected": "Likely not eligible", "predicted": "Possibly eligible (needs more info)", "parsed": true, "faithful": true},
+    {"case_id": 7, "expected": "Possibly eligible (needs more info)", "predicted": "Possibly eligible (needs more info)", "parsed": true, "faithful": true}
+  ]
+}
