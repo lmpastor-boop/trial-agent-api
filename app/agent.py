@@ -12,9 +12,10 @@ react to yet when /match is called. So `reflect`'s logic is exposed here as
 a plain function (submit_feedback) that the API's separate /feedback
 endpoint calls directly, not as a graph node reached by an edge.
 
-Everything else -- the age-only hard-criteria gate, the broaden-and-retry
-loop, the confidence-weighted memory read -- is unchanged from the
-validated notebook version.
+Everything else -- the broaden-and-retry loop, the confidence-weighted
+memory read -- is unchanged from the validated notebook version. The
+hard-criteria gate now checks disease-subtype relevance in addition to
+age (see the note above validate_hard_criteria_node for why).
 """
 from __future__ import annotations
 
@@ -31,11 +32,98 @@ from . import db
 
 MAX_SEARCH_ATTEMPTS = 2
 
+# How many raw results search_node pulls per attempt. 100, not 10: see the
+# comment in search_node for why. Named here, not inlined, so evals/
+# retrieval_eval.py can import the real value instead of hardcoding a copy
+# that silently goes stale the next time this changes -- exactly the bug
+# this constant's own introduction just avoided.
+SEARCH_RESULT_CAP = 100
+
 SUBTYPE_TO_PARENT_CATEGORY: dict[str, str] = {
     # Extend this as real narrow subtype codes are observed in production.
     # In a mature build this is a real ICD-10 hierarchy lookup, not a
     # hardcoded map -- see the capstone writeup for why.
 }
+
+# Same missing domain hierarchy as SUBTYPE_TO_PARENT_CATEGORY above, used in
+# the opposite direction: that table broadens a search that returned too
+# little, this one trims a search that returned too much. Both are stand-ins
+# for one real disease taxonomy that doesn't exist yet.
+#
+# Keys are subtype keywords findable in a patient_summary; values are the
+# substrings each keyword's presence should search for in a trial's
+# structured `conditions` list to detect a match.
+SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+    "aml": ["acute myeloid leukemia", "aml", "leukemia, myeloid, acute"],
+}
+
+# For each subtype keyword above, sibling subtypes that are clearly a
+# DIFFERENT disease -- exclude a trial only if its conditions name one of
+# these AND do not also mention the patient's own subtype. retrieval_eval.py
+# found real trials at rank 82-83/100 for a bare "leukemia" search because
+# CLL/ALL/CML trials that use the word "leukemia" prominently outrank
+# AML-specific trials in ClinicalTrials.gov's relevance ranking.
+INCOMPATIBLE_SUBTYPES: dict[str, list[str]] = {
+    "aml": [
+        "chronic lymphocytic leukemia", "cll",
+        "acute lymphoblastic leukemia", "all",
+        "chronic myeloid leukemia", "cml",
+        "hodgkin lymphoma", "non-hodgkin lymphoma", "lymphoma",
+        "multiple myeloma",
+    ],
+}
+
+
+def _extract_subtype_hints(patient_summary: str) -> set[str]:
+    """Which known subtype keywords (e.g. 'aml') does this patient's free-text
+    summary mention? Deterministic substring matching, not an LLM call --
+    keeps this gate free and fast, consistent with everything else standing
+    between raw search results and the paid Match step."""
+    text = patient_summary.lower()
+    return {
+        subtype for subtype, terms in SUBTYPE_KEYWORDS.items()
+        if any(term in text for term in terms)
+    }
+
+
+# Bound on how many "ambiguous" trials (see classify_disease_relevance) are
+# sent to Match per session. Confidently-relevant trials are NEVER capped --
+# if a pull genuinely contains 50 real AML trials, all 50 are worth the
+# Match cost, that's the system doing its job. But measure_cost.py showed a
+# real "leukemia" pull sending 53/100 trials to Match at $0.33/session
+# ($661k/mo projected at 1M users) once app.agent's original deny-list-only
+# filter defaulted every ambiguous case to "keep" -- against a real pool of
+# 611 currently-recruiting AML trials (checked directly against
+# ClinicalTrials.gov), an unbounded ambiguous bucket doesn't scale. 10 is a
+# starting point, not a validated number -- revisit with real data on how
+# often the ambiguous bucket actually contains a true positive vs. noise.
+AMBIGUOUS_RELEVANCE_CAP = 10
+
+
+def classify_disease_relevance(patient_summary: str, conditions: list[str]) -> str:
+    """Three-way, not two-way, because the two failure modes need opposite
+    defaults. 'relevant': the patient's own subtype is named in this trial's
+    conditions -- always kept, uncapped, regardless of volume. 'irrelevant':
+    conditions clearly name an incompatible sibling subtype and not the
+    patient's own -- always dropped. 'ambiguous': neither signal is
+    present (unrecognized condition text, or no condition data at all) --
+    bounded by AMBIGUOUS_RELEVANCE_CAP in validate_hard_criteria_node,
+    rather than kept unconditionally the way the original version of this
+    function did."""
+    hints = _extract_subtype_hints(patient_summary)
+    if not hints or not conditions:
+        return "ambiguous"
+
+    conditions_text = " ".join(conditions).lower()
+
+    if any(term in conditions_text for hint in hints for term in SUBTYPE_KEYWORDS[hint]):
+        return "relevant"
+
+    for hint in hints:
+        if any(bad in conditions_text for bad in INCOMPATIBLE_SUBTYPES.get(hint, [])):
+            return "irrelevant"
+
+    return "ambiguous"
 
 MATCH_VERDICTS = ["Likely eligible", "Possibly eligible (needs more info)", "Likely not eligible"]
 
@@ -54,6 +142,7 @@ class TrialCandidate(TypedDict):
     min_age: int
     max_age: int
     location: str
+    conditions: list[str]
 
 
 class Ranking(TypedDict):
@@ -77,6 +166,46 @@ class AgentState(TypedDict):
 
     search_query: str
     search_attempts: int
+
+
+# ---------------------------------------------------------------------------
+# Query sharpening -- built from a real, evidenced finding (see
+# evals/test_query_specificity.py): ClinicalTrials.gov's relevance ranking
+# for query.cond rewards a query that echoes a trial's own eligibility-
+# criteria phrasing, not just its diagnosis name. A bare "acute myeloid
+# leukemia" query ranked a real, RECRUITING NPM1-mutated AML trial 193rd of
+# 300 (beyond SEARCH_RESULT_CAP=100, effectively invisible); "NPM1 mutation
+# acute myeloid leukemia" ranked the SAME trial 8th of 300. Production
+# (main.py's /match endpoint) was passing the caller's raw diagnosis_code
+# straight into query.cond with zero refinement -- this closes that gap for
+# patients whose summary names a detectable point-mutation biomarker.
+#
+# NOT a general fix, and deliberately scoped to what was actually tested:
+# the same experiment found gene-REARRANGEMENT biomarkers behave
+# differently -- "KMT2A rearranged leukemia" and "KMT2A rearrangement acute
+# myeloid leukemia" did NOT rank a real trial that explicitly targets KMT2A
+# rearrangements at all, within 300 results. So this only covers point-
+# mutation biomarkers using the ONE phrasing pattern shown to work
+# ("{MARKER} mutation {diagnosis}"), and only for NPM1 -- the only marker
+# actually tested this way. FLT3/IDH1/IDH2 are common AML point mutations
+# that plausibly behave the same way, but that's an untested assumption, not
+# a validated finding -- treat them as candidates for the same test (re-run
+# test_query_specificity.py with a trial known to target one of them),
+# not as proven. Falls back to the caller's raw diagnosis_code (today's
+# behavior) whenever no known marker is detected -- zero regression risk
+# for every patient this doesn't apply to.
+VALIDATED_MUTATION_QUERY_HINTS = ["npm1"]
+
+
+def build_search_query(diagnosis_code: str, patient_summary: str) -> str:
+    """Sharpens the search query for patients whose summary names a
+    validated point-mutation biomarker; otherwise returns diagnosis_code
+    unchanged. See the comment above for exactly what's validated vs. not."""
+    text = patient_summary.lower()
+    for marker in VALIDATED_MUTATION_QUERY_HINTS:
+        if marker in text:
+            return f"{marker.upper()} mutation {diagnosis_code}"
+    return diagnosis_code
 
 
 # ---------------------------------------------------------------------------
@@ -113,28 +242,63 @@ def real_search_clinicaltrials_gov(search_query: str, max_results: int = 10) -> 
             "min_age": _parse_age(elig.get("minimumAge")) or 0,
             "max_age": _parse_age(elig.get("maximumAge")) or 130,
             "location": "see contactsLocationsModule (fetch separately if needed)",
+            # Condition was already being requested in `fields` above but
+            # silently discarded here -- found while building the disease-
+            # relevance filter, which needs exactly this structured signal.
+            "conditions": proto.get("conditionsModule", {}).get("conditions", []),
         })
     return candidates
 
 
 def search_node(state: AgentState) -> dict:
-    candidates = real_search_clinicaltrials_gov(state["search_query"])
+    # SEARCH_RESULT_CAP (100), not the function's own default of 10:
+    # retrieval_eval.py found real, ground-truth-eligible trials ranking
+    # 82nd-83rd out of 100 for a bare "leukemia" query -- the old default of
+    # 10 would never have reached them. Search calls are free; only Match
+    # calls cost money. NOTE: this is a recall fix, not a free one -- more
+    # genuinely relevant trials surviving the filter below means more Match
+    # calls per session than before, not fewer. Re-measure with
+    # measure_cost.py after this change rather than assuming it's neutral.
+    candidates = real_search_clinicaltrials_gov(state["search_query"], max_results=SEARCH_RESULT_CAP)
     return {"candidates": candidates}
 
 
 # ---------------------------------------------------------------------------
-# Hard-criteria gate -- deterministic, age-only (see capstone writeup:
-# diagnosis relevance is handled upstream by the search API's own
-# query.cond matching, not a local exact-match check)
+# Hard-criteria gate -- deterministic, no model call. Checks age AND, as of
+# the retrieval eval, disease-subtype relevance. Diagnosis relevance used to
+# be described as "handled upstream by the search API's own query.cond
+# matching" -- retrieval_eval.py proved that alone isn't enough (a bare
+# "leukemia" query ranks AML-specific trials behind CLL/ALL/CML trials that
+# just happen to use the word "leukemia" more prominently), so it's checked
+# here too now, deterministically and for free, before anything reaches Match.
+#
+# "Relevant" trials are never capped; "ambiguous" ones are, at
+# AMBIGUOUS_RELEVANCE_CAP -- see that constant's comment for why an
+# unbounded ambiguous bucket doesn't scale against a real, large trial pool.
 # ---------------------------------------------------------------------------
 def validate_hard_criteria_node(state: AgentState) -> dict:
     validated, rejected = [], []
+    ambiguous_kept = 0
     for trial in state["candidates"]:
         age_ok = trial["min_age"] <= state["patient_age"] <= trial["max_age"]
-        if age_ok:
-            validated.append(trial)
-        else:
+        if not age_ok:
             rejected.append(f"{trial['nct_id']}: age out of range ({trial['min_age']}-{trial['max_age']})")
+            continue
+
+        relevance = classify_disease_relevance(state["patient_summary"], trial.get("conditions", []))
+        if relevance == "irrelevant":
+            rejected.append(f"{trial['nct_id']}: disease subtype mismatch ({trial.get('conditions', [])})")
+            continue
+        if relevance == "ambiguous":
+            if ambiguous_kept >= AMBIGUOUS_RELEVANCE_CAP:
+                rejected.append(
+                    f"{trial['nct_id']}: ambiguous relevance, AMBIGUOUS_RELEVANCE_CAP "
+                    f"({AMBIGUOUS_RELEVANCE_CAP}) reached ({trial.get('conditions', [])})"
+                )
+                continue
+            ambiguous_kept += 1
+
+        validated.append(trial)
     status = "ok" if validated else "no_eligible_trials"
     return {"validated_candidates": validated, "rejected_hard_criteria": rejected, "status": status}
 
@@ -279,7 +443,10 @@ def run_match(patient_diagnosis_code: str, patient_age: int, patient_summary: st
         "lessons": [],
         "rejected_hard_criteria": [],
         "status": "",
-        "search_query": patient_diagnosis_code,
+        # Sharpened when possible (see build_search_query's comment) instead
+        # of the raw diagnosis_code -- falls back to diagnosis_code unchanged
+        # for every patient without a validated marker in their summary.
+        "search_query": build_search_query(patient_diagnosis_code, patient_summary),
         "search_attempts": 0,
     }
     return app.invoke(initial_state)

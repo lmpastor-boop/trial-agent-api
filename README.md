@@ -109,13 +109,40 @@ milestones, and the evidence each milestone should produce.
 
 ## Evals
 
-`evals/` holds offline evaluators plus the CI regression gate. The evaluators
-check faithfulness and use an independent judge meta-evaluated against the
-eight hand-labeled cases. `baseline_results.json` records the validated
-capstone run; `regression_gate.py` turns its accuracy, parsing, and
+`evals/` holds offline evaluation scripts plus the CI regression gate; none
+are invoked inside the live API request path.
+
+**Match accuracy:** a faithfulness check (does the Match rationale actually
+stick to the real trial text?) and an independent judge, meta-evaluated
+against the eight hand-labeled cases before being trusted to score larger
+batches of live trials. `baseline_results.json` records the validated
+capstone run, and `regression_gate.py` turns its accuracy, parsing, and
 faithfulness metrics into deployment-blocking thresholds. See
-`evals/README.md` and `EVAL_SKETCH.md` for the design rationale and failure
-analysis, including the `max_tokens` truncation bug the evaluations exposed.
+`evals/README.md` and `EVAL_SKETCH.md` for commands, design rationale, and
+real results, including the `max_tokens` truncation bug the evaluations
+exposed and helped fix in `real_match_trial()`.
+
+**Retrieval recall:** `evals/retrieval_eval.py` measures a different failure
+mode neither of the above can see -- a trial the patient genuinely qualifies
+for that search never surfaces at all, so it's never even scored. Run with
+`python evals/retrieval_eval.py`. This is what found and confirmed two real,
+live bugs: `SEARCH_RESULT_CAP` (10 -> 100; ground-truth trials were ranking
+82nd-83rd), and a discarded `Condition` API field the disease-relevance
+filter needed. It also drove `classify_disease_relevance` +
+`AMBIGUOUS_RELEVANCE_CAP` in `app/agent.py` (uncapped for confidently-
+relevant trials, capped for ambiguous ones -- a real 611-trial competing AML
+pool makes an unbounded "keep everything ambiguous" filter too expensive),
+and `build_search_query`, which sharpens the search term for patients whose
+summary names a validated point-mutation biomarker (currently just NPM1 --
+see that function's docstring in `app/agent.py` for exactly what's
+validated vs. not). `evals/find_new_ground_truth.py` and
+`evals/test_query_specificity.py` are the one-off diagnostics that found and
+validated that fix; not part of the ongoing eval suite, kept for reference.
+
+**Cost:** `measure_cost.py` runs the real `search_node` +
+`validate_hard_criteria_node` (not a hardcoded stand-in pull) and reports
+real measured token cost per session, including a relevant-vs-ambiguous
+breakdown of what's actually driving it. Run with `python measure_cost.py`.
 
 **Python 3.13 note:** `requirements.txt` pins `anthropic<0.100` and
 `langgraph<0.4`. Both packages' newest release trains (as of mid-2026)
