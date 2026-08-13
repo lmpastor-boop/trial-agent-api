@@ -5,6 +5,44 @@ demo/portfolio deployment -- not a HIPAA-compliant production build. See
 "Before this touches real patients" at the bottom for what that would
 actually require.
 
+## Live demo
+
+- **API:** [https://trial-agent-api.onrender.com](https://trial-agent-api.onrender.com)
+- **Health check:** [https://trial-agent-api.onrender.com/health](https://trial-agent-api.onrender.com/health)
+- **Interactive API documentation:** [https://trial-agent-api.onrender.com/docs](https://trial-agent-api.onrender.com/docs)
+
+The free Render instance may take about a minute to wake after inactivity.
+The health check is public; all workflow and data endpoints require an API
+key. The hosted service is a portfolio demonstration and accepts only
+synthetic or properly de-identified inputs.
+
+## Verified end-to-end workflow
+
+The deployed Render service and Neon Postgres database were tested together
+on August 13, 2026 using a synthetic AML case:
+
+1. An authenticated `POST /match` request completed successfully and produced
+   cited trial rankings plus a persistent review in `pending` status.
+2. A named synthetic reviewer approved the result through the human decision
+   endpoint, moving the review from `pending` to `approved` with a recorded
+   rationale.
+3. Repeating the decision returned **HTTP 409 Conflict**, confirming that an
+   approved or rejected review cannot be overwritten.
+4. Responses included request IDs for operational traceability, while audit
+   records excluded the free-text patient summary.
+
+Automated validation provides an additional deployment gate:
+
+| Check | Verified result |
+|-------|-----------------|
+| Automated tests | 16 passed |
+| Verdict accuracy | 87.5% (7/8 frozen hand-labeled cases) |
+| Output parsing | 100% |
+| Recorded rationale faithfulness | 100% |
+
+These results demonstrate the portfolio system's tested behavior; they are
+not claims of clinical efficacy or authorization for patient-care use.
+
 ## What's different from the Colab notebook
 
 - **Real code, not notebook cells.** The graph, nodes, and DB layer live in
